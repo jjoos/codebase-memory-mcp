@@ -623,7 +623,7 @@ TEST(tool_manage_adr_no_project) {
  * MUST FAIL before fix: free(buf) is called before yy_doc_to_str serializes doc,
  * so result field is missing or contains garbage. MUST PASS after fix. */
 TEST(tool_manage_adr_get_with_existing_adr) {
-    /* Create a temp directory with .codebase-memory/adr.md */
+    /* Create a temp directory with .codebase-memory/adrs/default.md */
     char tmp_dir[256];
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-test-XXXXXX");
     if (!cbm_mkdtemp(tmp_dir)) {
@@ -634,8 +634,12 @@ TEST(tool_manage_adr_get_with_existing_adr) {
     snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", tmp_dir);
     cbm_mkdir(adr_dir);
 
+    char adrs_dir[512];
+    snprintf(adrs_dir, sizeof(adrs_dir), "%s/adrs", adr_dir);
+    cbm_mkdir(adrs_dir);
+
     char adr_path[512];
-    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    snprintf(adr_path, sizeof(adr_path), "%s/default.md", adrs_dir);
     FILE *fp = fopen(adr_path, "w");
     ASSERT_NOT_NULL(fp);
     fputs("## PURPOSE\nTest ADR content for regression test.\n\n"
@@ -671,7 +675,161 @@ TEST(tool_manage_adr_get_with_existing_adr) {
     /* Clean up */
     cbm_mcp_server_free(srv);
     remove(adr_path);
+    rmdir(adrs_dir);
     rmdir(adr_dir);
+    rmdir(tmp_dir);
+    PASS();
+}
+
+/* Helper: set up a temp project with two named ADR files. */
+static bool setup_multi_adr_project(char *tmp_dir, size_t tmp_dir_size,
+                                    char *adrs_dir, size_t adrs_dir_size) {
+    snprintf(tmp_dir, tmp_dir_size, "/tmp/cbm-adr-multi-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        return false;
+    }
+    char cbm_dir[512];
+    snprintf(cbm_dir, sizeof(cbm_dir), "%s/.codebase-memory", tmp_dir);
+    cbm_mkdir(cbm_dir);
+    snprintf(adrs_dir, adrs_dir_size, "%s/adrs", cbm_dir);
+    cbm_mkdir(adrs_dir);
+
+    /* Write two ADRs */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/use-sqlite.md", adrs_dir);
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        return false;
+    }
+    fputs("## PURPOSE\nChoose SQLite as embedded database.\n\n## DECISION\nUse SQLite.\n", fp);
+    fclose(fp);
+
+    snprintf(path, sizeof(path), "%s/use-json-rpc.md", adrs_dir);
+    fp = fopen(path, "w");
+    if (!fp) {
+        return false;
+    }
+    fputs("## PURPOSE\nChoose JSON-RPC 2.0 as transport.\n\n## DECISION\nUse JSON-RPC.\n", fp);
+    fclose(fp);
+
+    return true;
+}
+
+TEST(tool_manage_adr_list) {
+    char tmp_dir[256];
+    char adrs_dir[512];
+    if (!setup_multi_adr_project(tmp_dir, sizeof(tmp_dir), adrs_dir, sizeof(adrs_dir))) {
+        PASS(); /* skip if setup fails */
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "test-adr-list", tmp_dir);
+    cbm_mcp_server_set_project(srv, "test-adr-list");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\","
+             "\"arguments\":{\"project\":\"test-adr-list\",\"mode\":\"list\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "adrs"));
+    ASSERT_NOT_NULL(strstr(resp, "use-sqlite"));
+    ASSERT_NOT_NULL(strstr(resp, "use-json-rpc"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+
+    /* Clean up */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/use-sqlite.md", adrs_dir);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/use-json-rpc.md", adrs_dir);
+    remove(path);
+    rmdir(adrs_dir);
+    char cbm_dir[512];
+    snprintf(cbm_dir, sizeof(cbm_dir), "%s/.codebase-memory", tmp_dir);
+    rmdir(cbm_dir);
+    rmdir(tmp_dir);
+    PASS();
+}
+
+TEST(tool_manage_adr_search) {
+    char tmp_dir[256];
+    char adrs_dir[512];
+    if (!setup_multi_adr_project(tmp_dir, sizeof(tmp_dir), adrs_dir, sizeof(adrs_dir))) {
+        PASS(); /* skip if setup fails */
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "test-adr-search", tmp_dir);
+    cbm_mcp_server_set_project(srv, "test-adr-search");
+
+    /* Search for "SQLite" — should match use-sqlite.md but not use-json-rpc.md */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\","
+             "\"arguments\":{\"project\":\"test-adr-search\",\"mode\":\"search\","
+             "\"keyword\":\"SQLite\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "matches"));
+    ASSERT_NOT_NULL(strstr(resp, "use-sqlite"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+
+    /* Clean up */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/use-sqlite.md", adrs_dir);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/use-json-rpc.md", adrs_dir);
+    remove(path);
+    rmdir(adrs_dir);
+    char cbm_dir[512];
+    snprintf(cbm_dir, sizeof(cbm_dir), "%s/.codebase-memory", tmp_dir);
+    rmdir(cbm_dir);
+    rmdir(tmp_dir);
+    PASS();
+}
+
+TEST(tool_manage_adr_named_update_get) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-named-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_store_upsert_project(st, "test-adr-named", tmp_dir);
+    cbm_mcp_server_set_project(srv, "test-adr-named");
+
+    /* Update a named ADR */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\","
+             "\"arguments\":{\"project\":\"test-adr-named\",\"mode\":\"update\","
+             "\"adr_id\":\"use-postgres\",\"content\":\"## PURPOSE\\nUse PostgreSQL.\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    ASSERT_NOT_NULL(strstr(resp, "use-postgres"));
+    free(resp);
+
+    /* Read it back */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\","
+             "\"arguments\":{\"project\":\"test-adr-named\",\"mode\":\"get\","
+             "\"adr_id\":\"use-postgres\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "PostgreSQL"));
+    ASSERT_NOT_NULL(strstr(resp, "use-postgres"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
     rmdir(tmp_dir);
     PASS();
 }
@@ -1714,6 +1872,9 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
+    RUN_TEST(tool_manage_adr_list);
+    RUN_TEST(tool_manage_adr_search);
+    RUN_TEST(tool_manage_adr_named_update_get);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 
