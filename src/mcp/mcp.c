@@ -374,9 +374,13 @@ static const tool_def_t TOOLS[] = {
      "\"Git ref or date to compare from (e.g. HEAD~5, v0.5.0, 2026-01-01)\"}},\"required\":"
      "[\"project\"]}"},
 
-    {"manage_adr", "Create or update Architecture Decision Records",
+    {"manage_adr", "Create, update, list or search Architecture Decision Records (multiple per project)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"list\",\"search\"]},"
+     "\"adr_id\":{\"type\":\"string\",\"description\":\"ADR identifier/slug (default: \\\"default\\\"). "
+     "Used to address a specific ADR within the project.\"},"
+     "\"content\":{\"type\":\"string\"},"
+     "\"keyword\":{\"type\":\"string\",\"description\":\"Keyword to search across all ADRs (for mode=search)\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
@@ -3243,13 +3247,95 @@ static char *adr_read_content(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, con
     return NULL;
 }
 
+/* ADR "list" mode: enumerate all ADR slugs in the adrs/ subdirectory. */
+static void adr_list_all(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const char *adrs_dir) {
+    yyjson_mut_val *list = yyjson_mut_arr(doc);
+    cbm_dir_t *d = cbm_opendir(adrs_dir);
+    if (d) {
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL) {
+            if (ent->is_dir) {
+                continue;
+            }
+            size_t nlen = strlen(ent->name);
+            if (nlen > 3 && strcmp(ent->name + nlen - 3, ".md") == 0) {
+                char id[CBM_DIRENT_NAME_MAX];
+                size_t id_len = nlen - 3;
+                memcpy(id, ent->name, id_len);
+                id[id_len] = '\0';
+                yyjson_mut_arr_add_strcpy(doc, list, id);
+            }
+        }
+        cbm_closedir(d);
+    }
+    yyjson_mut_obj_add_val(doc, root_obj, "adrs", list);
+}
+
+/* ADR "search" mode: case-sensitive keyword search across all ADR files. */
+static void adr_search_all(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const char *adrs_dir,
+                           const char *keyword) {
+    yyjson_mut_val *matches = yyjson_mut_arr(doc);
+    cbm_dir_t *d = cbm_opendir(adrs_dir);
+    if (d) {
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL) {
+            if (ent->is_dir) {
+                continue;
+            }
+            size_t nlen = strlen(ent->name);
+            if (nlen <= 3 || strcmp(ent->name + nlen - 3, ".md") != 0) {
+                continue;
+            }
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s", adrs_dir, ent->name);
+            FILE *fp = fopen(path, "r");
+            if (!fp) {
+                continue;
+            }
+            (void)fseek(fp, 0, SEEK_END);
+            long sz = ftell(fp);
+            if (sz <= 0) {
+                (void)fclose(fp);
+                continue;
+            }
+            (void)fseek(fp, 0, SEEK_SET);
+            char *buf = malloc((size_t)sz + SKIP_ONE);
+            size_t nr = fread(buf, SKIP_ONE, (size_t)sz, fp);
+            if (nr > (size_t)sz) {
+                nr = (size_t)sz;
+            }
+            buf[nr] = '\0';
+            (void)fclose(fp);
+            if (strstr(buf, keyword)) {
+                char id[CBM_DIRENT_NAME_MAX];
+                size_t id_len = nlen - 3;
+                memcpy(id, ent->name, id_len);
+                id[id_len] = '\0';
+                yyjson_mut_val *match = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, match, "adr_id", id);
+                yyjson_mut_obj_add_strcpy(doc, match, "content", buf);
+                yyjson_mut_arr_add_val(matches, match);
+            }
+            free(buf);
+        }
+        cbm_closedir(d);
+    }
+    yyjson_mut_obj_add_val(doc, root_obj, "matches", matches);
+    yyjson_mut_obj_add_str(doc, root_obj, "keyword", keyword);
+}
+
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *content = cbm_mcp_get_string_arg(args, "content");
+    char *adr_id = cbm_mcp_get_string_arg(args, "adr_id");
+    char *keyword = cbm_mcp_get_string_arg(args, "keyword");
 
     if (!mode_str) {
         mode_str = heap_strdup("get");
+    }
+    if (!adr_id) {
+        adr_id = heap_strdup("default");
     }
 
     char *root_path = get_project_root(srv, project);
@@ -3257,26 +3343,36 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(mode_str);
         free(content);
+        free(adr_id);
+        free(keyword);
         return cbm_mcp_text_result("project not found", true);
     }
 
-    char adr_dir[CBM_SZ_4K];
-    snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", root_path);
+    char cbm_dir[CBM_SZ_4K];
+    snprintf(cbm_dir, sizeof(cbm_dir), "%s/.codebase-memory", root_path);
+    char adrs_dir[CBM_SZ_4K];
+    snprintf(adrs_dir, sizeof(adrs_dir), "%s/adrs", cbm_dir);
     char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    snprintf(adr_path, sizeof(adr_path), "%s/%s.md", adrs_dir, adr_id);
 
     char *adr_buf = NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
-    if (strcmp(mode_str, "update") == 0 && content) {
-        cbm_mkdir(adr_dir);
+    if (strcmp(mode_str, "list") == 0) {
+        adr_list_all(doc, root_obj, adrs_dir);
+    } else if (strcmp(mode_str, "search") == 0 && keyword) {
+        adr_search_all(doc, root_obj, adrs_dir, keyword);
+    } else if (strcmp(mode_str, "update") == 0 && content) {
+        cbm_mkdir(cbm_dir);
+        cbm_mkdir(adrs_dir);
         FILE *fp = fopen(adr_path, "w");
         if (fp) {
             (void)fputs(content, fp);
             (void)fclose(fp);
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
+            yyjson_mut_obj_add_str(doc, root_obj, "adr_id", adr_id);
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
         }
@@ -3284,6 +3380,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         adr_list_sections(doc, root_obj, adr_path);
     } else {
         adr_buf = adr_read_content(doc, root_obj, adr_path);
+        yyjson_mut_obj_add_str(doc, root_obj, "adr_id", adr_id);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -3293,6 +3390,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     free(project);
     free(mode_str);
     free(content);
+    free(adr_id);
+    free(keyword);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
