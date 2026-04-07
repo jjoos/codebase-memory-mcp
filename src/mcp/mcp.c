@@ -380,7 +380,7 @@ static const tool_def_t TOOLS[] = {
      "\"adr_id\":{\"type\":\"string\",\"description\":\"ADR identifier/slug (default: \\\"default\\\"). "
      "Used to address a specific ADR within the project.\"},"
      "\"content\":{\"type\":\"string\"},"
-     "\"keyword\":{\"type\":\"string\",\"description\":\"Keyword to search across all ADRs (for mode=search)\"},"
+     "\"keyword\":{\"type\":\"string\",\"description\":\"Keyword to search across all ADRs (for mode=search, case-sensitive)\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
@@ -3300,10 +3300,7 @@ static void adr_search_all(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const 
             }
             (void)fseek(fp, 0, SEEK_SET);
             char *buf = malloc((size_t)sz + SKIP_ONE);
-            size_t nr = fread(buf, SKIP_ONE, (size_t)sz, fp);
-            if (nr > (size_t)sz) {
-                nr = (size_t)sz;
-            }
+            size_t nr = fread(buf, 1, (size_t)sz, fp);
             buf[nr] = '\0';
             (void)fclose(fp);
             if (strstr(buf, keyword)) {
